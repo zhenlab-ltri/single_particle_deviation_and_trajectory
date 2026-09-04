@@ -11,115 +11,49 @@ import threading
 from scipy.ndimage import gaussian_filter1d
 
 
-def _boundary_along_rows(mask_2d, want_right):
-    """Row-wise boundary scan excluding absolute image canvas borders."""
-    h, w = mask_2d.shape
-    has_pixel = np.any(mask_2d > 0, axis=1)
-    full_row = np.all(mask_2d > 0, axis=1)
-    valid_y = np.where(has_pixel & ~full_row)[0]
-    if len(valid_y) == 0:
-        return np.empty((0, 2)), 0.0, 0.0
-
-    if want_right:
-        flipped = mask_2d[:, ::-1]
-        first_from_right = np.argmax(flipped > 0, axis=1)
-        valid_x = (w - 1) - first_from_right[valid_y]
-    else:
-        valid_x = np.argmax(mask_2d > 0, axis=1)[valid_y]
-
-    # Discard points touching canvas edges
-    valid_mask = (valid_x > 0) & (valid_x < w - 1)
-    valid_y = valid_y[valid_mask]
-    valid_x = valid_x[valid_mask]
-
-    if len(valid_y) == 0:
-        return np.empty((0, 2)), 0.0, 0.0
-
-    # First column = along-axis (y), second = across (x)
-    pts = np.column_stack((valid_y.astype(np.float64), valid_x.astype(np.float64)))
-    pts = pts[np.argsort(pts[:, 0])]
-    return pts, pts[0, 0], pts[-1, 0]
-
-
-def _boundary_along_columns(mask_2d, want_bottom):
-    """Column-wise boundary scan excluding absolute image canvas borders."""
-    h, w = mask_2d.shape
-    has_pixel = np.any(mask_2d > 0, axis=0)
-    full_column = np.all(mask_2d > 0, axis=0)
-    valid_x = np.where(has_pixel & ~full_column)[0]
-    if len(valid_x) == 0:
-        return np.empty((0, 2)), 0.0, 0.0
-
-    if want_bottom:
-        flipped = mask_2d[::-1, :]
-        first_from_bottom = np.argmax(flipped > 0, axis=0)
-        valid_y = (h - 1) - first_from_bottom[valid_x]
-    else:
-        valid_y = np.argmax(mask_2d > 0, axis=0)[valid_x]
-
-    # Discard points touching canvas edges
-    valid_mask = (valid_y > 0) & (valid_y < h - 1)
-    valid_x = valid_x[valid_mask]
-    valid_y = valid_y[valid_mask]
-
-    if len(valid_x) == 0:
-        return np.empty((0, 2)), 0.0, 0.0
-
-    # First column = along-axis (x), second = across (y)
-    pts = np.column_stack((valid_x.astype(np.float64), valid_y.astype(np.float64)))
-    pts = pts[np.argsort(pts[:, 0])]
-    return pts, pts[0, 0], pts[-1, 0]
-
-
-def _line_cleanliness(mask, along_rows):
-    """Fraction of clean scanning lines."""
-    lines = (mask > 0) if along_rows else (mask > 0).T
-    padded = np.zeros((lines.shape[0], lines.shape[1] + 2), dtype=bool)
-    padded[:, 1:-1] = lines
-    d = np.diff(padded.astype(np.int8), axis=1)
-    n_runs = np.sum(d == 1, axis=1)
-    return float(np.mean(n_runs <= 1))
-
-
-def extract_boundary_pair(upper_mask, lower_mask, prev_orientation=None, orientation_margin=1.1):
-    """Auto-orienting boundary extraction pair (from Version 2)."""
+def extract_boundary_points(binary_mask, boundary_type):
+    """
+    Extracts the upper boundary of frames of lower mask and the lower boundary of frames of upper mask.
+    Columns that are fully colored top-to-bottom (no real edge, just a solid
+    band) are ignored and excluded from the returned points.
+    Args:
+    - binary_mask: The particular frame with mask
+    - boundary_type: Determines whether to extract the upper edge or the lower edge
+    Returns the x and y coordinates of the boundary in a 2 dimensional array (N x 2), the maximum and minimum x value where the mask exists.
+    """
+    h, w = binary_mask.shape
+    
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    clean_u = cv2.morphologyEx(upper_mask, cv2.MORPH_CLOSE, kernel)
-    clean_u = cv2.morphologyEx(clean_u, cv2.MORPH_OPEN, kernel)
-    clean_l = cv2.morphologyEx(lower_mask, cv2.MORPH_CLOSE, kernel)
-    clean_l = cv2.morphologyEx(clean_l, cv2.MORPH_OPEN, kernel)
+    cleaned_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
+    cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_OPEN, kernel)
+    
+    has_pixel   = np.any(cleaned_mask > 0, axis=0)
+    full_column = np.all(cleaned_mask > 0, axis=0)
+    has_pixel   = has_pixel & ~full_column
+    valid_x = np.where(has_pixel)[0]
+    
+    if len(valid_x) == 0:
+        return np.empty((0, 2)), 0, 0
 
-    uy_px, ux_px = np.where(clean_u > 0)
-    ly_px, lx_px = np.where(clean_l > 0)
-
-    if len(ux_px) == 0 or len(lx_px) == 0:
-        return np.empty((0, 2)), 0.0, 0.0, np.empty((0, 2)), 0.0, 0.0, None
-
-    row_score = (_line_cleanliness(clean_u, True) + _line_cleanliness(clean_l, True)) / 2.0
-    col_score = (_line_cleanliness(clean_u, False) + _line_cleanliness(clean_l, False)) / 2.0
-
-    vertical = row_score > col_score
-    if prev_orientation == 'horizontal':
-        vertical = row_score > col_score * orientation_margin
-    elif prev_orientation == 'vertical':
-        vertical = not (col_score > row_score * orientation_margin)
-
-    if vertical:
-        u_is_left = ux_px.mean() < lx_px.mean()
-        upper_pts, u_min, u_max = _boundary_along_rows(clean_u, want_right=u_is_left)
-        lower_pts, l_min, l_max = _boundary_along_rows(clean_l, want_right=not u_is_left)
-        orientation = 'vertical'
+    if boundary_type == 'upper':
+        flipped_mask = cleaned_mask[::-1, :]
+        first_y_from_bottom = np.argmax(flipped_mask > 0, axis=0)
+        valid_y = (h - 1) - first_y_from_bottom[valid_x]
     else:
-        u_is_top = uy_px.mean() < ly_px.mean()
-        upper_pts, u_min, u_max = _boundary_along_columns(clean_u, want_bottom=u_is_top)
-        lower_pts, l_min, l_max = _boundary_along_columns(clean_l, want_bottom=not u_is_top)
-        orientation = 'horizontal'
+        valid_y = np.argmax(cleaned_mask > 0, axis=0)[valid_x]
+        
+    points = np.column_stack((valid_x, valid_y.astype(np.float64)))
+    
+    sort_idx = np.argsort(points[:, 0])
+    points = points[sort_idx]
+    
+    raw_min_x = points[0, 0]
+    raw_max_x = points[-1, 0]
+        
+    return points, raw_min_x, raw_max_x
 
-    if len(upper_pts) == 0 or len(lower_pts) == 0:
-        return np.empty((0, 2)), 0.0, 0.0, np.empty((0, 2)), 0.0, 0.0, orientation
 
-    return upper_pts, u_min, u_max, lower_pts, l_min, l_max, orientation
-
+import numpy as np
 
 def centerline(upper_pts, lower_pts, num_nodes=2000, trig_harmonics=3, base_poly_degree=7):
     """
@@ -279,7 +213,6 @@ def extend_to_edges(pts, target_min_x, target_max_x, num_ext_nodes=10):
 
     return np.column_stack((resampled_x, resampled_y))
 
-
 def extract_frame_number(filename):
     """
     Extracts frame number from filename.
@@ -416,9 +349,8 @@ def refine_temporal(spatial_skeletons, temporal_sigma=0.5, batch_size=None):
     return result
 
 
-def refine_skeletons(skeleton_dict, target_bounds=None, orientations=None,
-                     scale_limit_px=3.0, spatial_sigma=1.2,
-                     curve_degree=4, temporal_sigma=0.5, temporal_batch_size=None):
+def refine_skeletons(skeleton_dict, target_bounds=None, scale_limit_px=3.0, spatial_sigma=1.2,
+                      curve_degree=4, temporal_sigma=0.5, temporal_batch_size=None):
     """
     Runs the full refinement (spatial per-frame -> edge extension -> temporal
     across frames) on an in-memory set of centerlines, without touching disk.
@@ -431,19 +363,12 @@ def refine_skeletons(skeleton_dict, target_bounds=None, orientations=None,
     rather than the raw fit - is what keeps the line landing edge-to-edge
     instead of being pulled back short by the damping step.
 
-    For vertical orientation frames the primary axis is y. Points are temporarily
-    swapped to (y, x) so that extend_to_edges (which works on the first coordinate)
-    can be reused unchanged, then swapped back.
-
     Args:
         skeleton_dict: dict of {frame_id: (N, 2) array} of raw centerline points.
-        target_bounds: optional dict of {frame_id: (target_min, target_max)}.
+        target_bounds: optional dict of {frame_id: (target_min_x, target_max_x)}.
             When given, each frame's spatially-refined line is extended out to
-            these bounds (along the primary axis) before temporal smoothing.
-            Frames missing from this dict are left unextended. None (default)
-            skips extension entirely.
-        orientations: optional dict of {frame_id: 'horizontal'|'vertical'}.
-            Required for correct extension when some frames are vertical.
+            these x bounds before temporal smoothing. Frames missing from this
+            dict are left unextended. None (default) skips extension entirely.
         scale_limit_px: threshold pixel value for the spatial step.
         spatial_sigma: sigma value for the spatial gaussian filtering.
         curve_degree: degree of the global reference curve used in the spatial
@@ -461,20 +386,10 @@ def refine_skeletons(skeleton_dict, target_bounds=None, orientations=None,
     }
 
     if target_bounds is not None:
-        extended = {}
-        for fid, pts in spatial_skeletons.items():
-            if fid not in target_bounds:
-                extended[fid] = pts
-                continue
-            orient = orientations.get(fid, 'horizontal') if orientations is not None else 'horizontal'
-            if orient == 'vertical':
-                # Work in (y, x) so primary axis is first coordinate
-                swapped = pts[:, [1, 0]]
-                ext = extend_to_edges(swapped, *target_bounds[fid])
-                extended[fid] = ext[:, [1, 0]]
-            else:
-                extended[fid] = extend_to_edges(pts, *target_bounds[fid])
-        spatial_skeletons = extended
+        spatial_skeletons = {
+            fid: (extend_to_edges(pts, *target_bounds[fid]) if fid in target_bounds else pts)
+            for fid, pts in spatial_skeletons.items()
+        }
 
     return refine_temporal(spatial_skeletons, temporal_sigma, temporal_batch_size)
 
@@ -489,8 +404,6 @@ def refine_csv(file_path, scale_limit_px=3.0, spatial_sigma=1.2, curve_degree=4,
        (frame_min_x/frame_max_x columns), using the refined line's own end
        tangents (see extend_to_edges). Frames without those columns are left
        as-is (older CSVs without them will just skip extension).
-       For vertical frames the stored bounds are the primary-axis (y) extents;
-       points are temporarily swapped so extension still works correctly.
     3. Filters individual nodes by tracking them across multiple frames to
        drop major changes caused by improper masks.
     Args:
@@ -519,21 +432,14 @@ def refine_csv(file_path, scale_limit_px=3.0, spatial_sigma=1.2, curve_degree=4,
     }
 
     target_bounds = None
-    orientations = None
     if 'frame_min_x' in df.columns and 'frame_max_x' in df.columns:
         target_bounds = {
             fid: (frame_groups[fid]['frame_min_x'].iloc[0], frame_groups[fid]['frame_max_x'].iloc[0])
             for fid in order
         }
-        if 'orientation' in df.columns:
-            orientations = {
-                fid: frame_groups[fid]['orientation'].iloc[0]
-                for fid in order
-            }
 
-    refined = refine_skeletons(skeleton_dict, target_bounds, orientations,
-                               scale_limit_px, spatial_sigma,
-                               curve_degree, temporal_sigma, temporal_batch_size)
+    refined = refine_skeletons(skeleton_dict, target_bounds, scale_limit_px, spatial_sigma,
+                                curve_degree, temporal_sigma, temporal_batch_size)
 
     out_rows = []
     for fid in order:
@@ -549,9 +455,8 @@ def refine_csv(file_path, scale_limit_px=3.0, spatial_sigma=1.2, curve_degree=4,
 
 def create_csv(folders, boundary, input_path, output_path):
     """
-    Writes a csv file that is (N * num_nodes) x 6, each row containing 
-    frame number, node id, x coordinate, y coordinate, the global node spacing,
-    the primary-axis mask extents, and the detected orientation.
+    Writes a csv file that is (N * num_nodes) x 5, each row containing 
+    frame number, node id, x coordinate, y coordinate, and the global node spacing.
     Args:
         folders: paths to folders with the upper masks and lower masks
         boundary: ['upper', 'lower'] for computing the specific edge of each mask
@@ -572,9 +477,8 @@ def create_csv(folders, boundary, input_path, output_path):
     with open(output_path, mode='w', newline='') as csv_file:
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow(['frame_id', 'node_id', 'x_pixel', 'y_pixel', 'node_spacing',
-                              'frame_min_x', 'frame_max_x', 'orientation'])
+                              'frame_min_x', 'frame_max_x'])
     
-        prev_orientation = None
         for u_file, l_file in zip(upper_files, lower_files):
             frame_idx = extract_frame_number(u_file)
             if frame_idx is None or frame_idx >= total_video_frames:
@@ -589,42 +493,28 @@ def create_csv(folders, boundary, input_path, output_path):
             _, mask_u = cv2.threshold(img_u, 1, 255, cv2.THRESH_BINARY)
             _, mask_l = cv2.threshold(img_l, 1, 255, cv2.THRESH_BINARY)
             
-            upper_pts, u_min, u_max, lower_pts, l_min, l_max, orientation = extract_boundary_pair(
-                mask_u, mask_l, prev_orientation=prev_orientation
-            )
-            if orientation is not None:
-                prev_orientation = orientation
+            upper_pts, u_min, u_max = extract_boundary_points(mask_u, 'upper')
+            lower_pts, l_min, l_max = extract_boundary_points(mask_l, 'lower')
             
-            # Points arrive already ordered by primary axis:
-            #   horizontal → (x, y)
-            #   vertical   → (y, x)
             skeleton_nodes = centerline(upper_pts, lower_pts,
                                         num_nodes=2000, trig_harmonics=3, base_poly_degree=3)
             
             if skeleton_nodes is not None:
-                # Bring vertical results back to image coordinates (x, y)
-                if orientation == 'vertical':
-                    skeleton_nodes = skeleton_nodes[:, [1, 0]]
-
                 dx = np.diff(skeleton_nodes[:, 0])
                 dy = np.diff(skeleton_nodes[:, 1])
                 step_distances = np.sqrt(dx**2 + dy**2)
                 node_spacing = np.mean(step_distances)
 
-                # Primary-axis extents (x for horizontal, y for vertical).
-                # Stored under the same column names so the post-refinement
-                # extend_to_edges path stays unchanged; orientation tells the
-                # refinement stage how to interpret them.
-                frame_min_primary = min(u_min, l_min)
-                frame_max_primary = max(u_max, l_max)
+                # Recorded here (not applied here) so the refinement stage can
+                # extend the *refined* line out to the true mask extent later.
+                frame_min_x = min(u_min, l_min)
+                frame_max_x = max(u_max, l_max)
                 
                 for node_idx, (x_val, y_val) in enumerate(skeleton_nodes):
                     safe_x = np.clip(x_val, 0, width - 1)
                     safe_y = np.clip(y_val, 0, img_height - 1)
                     csv_writer.writerow([frame_idx, node_idx, f"{safe_x:.4f}", f"{safe_y:.4f}",
-                                          f"{node_spacing:.6f}",
-                                          f"{frame_min_primary:.4f}", f"{frame_max_primary:.4f}",
-                                          orientation if orientation is not None else 'horizontal'])
+                                          f"{node_spacing:.6f}", f"{frame_min_x:.4f}", f"{frame_max_x:.4f}"])
 
 
 def create_overlay_video(input_source, csv_coordinates_path, output_video_path, fps=30):
