@@ -9,7 +9,7 @@ The code can be installed as is and can be run after setting up a virtual enviro
 
 | File | Role |
 |---|---|
-| `nd2_hdf5.ipynb` | Converts an nd2 file into h5 format with an interactive window for choosing appropriate resolution. |
+| `nd2_hdf5.ipynb` | Converts an nd2 file into h5 format with an interactive window for choosing appropriate resolution and cropped section. |
 | `line_generator.py` | Takes in the upper and lower boundaries to generate an approximate centerline of the pharynx. |
 | `mask_editor.py` | PyQt5 GUI: multi-layer mask editing, drawing (point/brush/eraser), undo/redo, and the background thread that drives propagation. |
 | `propagate_edge.py` | Propagation driver for **open-line** strokes (`upper_left` / `lower_right` edge clipping). |
